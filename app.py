@@ -1,32 +1,34 @@
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-from config import AI_API_KEY, AUDIO_DIR, JOBS_DIR, MAX_UPLOAD_BYTES, OUTPUT_DIR, APP_NAME, ensure_directories
-from worker import start_worker
+from config import (
+    AI_API_KEY,
+    AUDIO_DIR,
+    JOBS_DIR,
+    OUTPUT_DIR,
+    APP_NAME,
+    ensure_directories,
+)
+from worker import start_worker, transcribe_audio
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("defcomm-ai")
+logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=APP_NAME, version="1.0.0")
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+app = FastAPI(title=APP_NAME, version="1.1.0")
 
 
-def verify_api_key(authorization: str | None) -> None:
+def verify_api_key(authorization: str | None = None):
     if not AI_API_KEY:
-        raise HTTPException(status_code=500, detail="AI service API key is not configured")
-
-    expected = f"Bearer {AI_API_KEY}"
-    if authorization != expected:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    if authorization.removeprefix("Bearer ") != AI_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid AI service API key")
 
 
@@ -38,96 +40,102 @@ def startup() -> None:
 
 
 @app.get("/health")
-def health() -> dict[str, object]:
+def health():
     return {"ok": True, "service": APP_NAME}
+
+
+# Actual implementation using a Request keeps multipart and Authorization clean.
+from fastapi import Request
+
+@app.post("/v1/live/transcribe")
+async def live_transcribe(
+    request: Request,
+    audio: Annotated[UploadFile, File()],
+    meeting_id: Annotated[str, Form()],
+    participant_id: Annotated[str, Form()],
+    speaker_name: Annotated[str, Form()] = "Participant",
+    sequence: Annotated[int, Form()] = 0,
+    offset_ms: Annotated[str, Form()] = "",
+):
+    verify_api_key(request.headers.get("authorization"))
+
+    data = await audio.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty audio chunk")
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio chunk exceeds 5 MB")
+
+    suffix = Path(audio.filename or "live-audio.webm").suffix or ".webm"
+    temp = AUDIO_DIR / f"live-{uuid.uuid4()}{suffix}"
+    temp.write_bytes(data)
+
+    try:
+        result = transcribe_audio(temp)
+        return {
+            "meeting_id": meeting_id,
+            "participant_id": participant_id,
+            "speaker_name": speaker_name,
+            "sequence": sequence,
+            "offset_ms": int(offset_ms) if offset_ms else None,
+            "text": result["text"],
+            "segments": result["segments"],
+        }
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 @app.post("/v1/transcriptions")
 async def create_transcription(
+    request: Request,
     meeting_id: Annotated[str, Form()],
     recording_id: Annotated[str, Form()],
     metadata: Annotated[str, Form()],
     files: Annotated[list[UploadFile], File()],
-    authorization: Annotated[str | None, Header()] = None,
 ):
-    verify_api_key(authorization)
-
-    if not files:
-        raise HTTPException(status_code=400, detail="At least one audio file is required")
-
+    verify_api_key(request.headers.get("authorization"))
     try:
         metadata_items = json.loads(metadata)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="metadata must be valid JSON")
-
-    if not isinstance(metadata_items, list):
+        if not isinstance(metadata_items, list):
+            raise ValueError
+    except Exception:
         raise HTTPException(status_code=400, detail="metadata must be a JSON array")
 
     metadata_by_filename = {
-        item["filename"]: item
-        for item in metadata_items
-        if isinstance(item, dict)
-        and isinstance(item.get("filename"), str)
-        and isinstance(item.get("participant_id"), str)
+        item["filename"]: item for item in metadata_items
+        if isinstance(item, dict) and "filename" in item and "participant_id" in item
     }
-
     job_id = str(uuid.uuid4())
     job_audio_dir = AUDIO_DIR / job_id
     job_output_dir = OUTPUT_DIR / job_id
     job_audio_dir.mkdir(parents=True, exist_ok=True)
     job_output_dir.mkdir(parents=True, exist_ok=True)
-
-    total_bytes = 0
     tracks = []
 
-    try:
-        for upload in files:
-            original_filename = upload.filename or f"{uuid.uuid4()}.mkv"
-            metadata_item = metadata_by_filename.get(original_filename)
-            if not metadata_item:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Missing participant metadata for {original_filename}",
-                )
-
-            safe_filename = Path(original_filename).name
-            destination = job_audio_dir / safe_filename
-            file_bytes = 0
-
-            with destination.open("wb") as output_file:
-                while True:
-                    chunk = await upload.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    file_bytes += len(chunk)
-                    total_bytes += len(chunk)
-                    if total_bytes > MAX_UPLOAD_BYTES:
-                        raise HTTPException(status_code=413, detail="Transcription upload is too large")
-                    output_file.write(chunk)
-
-            await upload.close()
-
-            tracks.append(
-                {
-                    "path": str(destination),
-                    "filename": original_filename,
-                    "participant_id": metadata_item["participant_id"],
-                    "speaker_name": metadata_item.get("speaker_name"),
-                    "bytes": file_bytes,
-                }
-            )
-
-    except HTTPException:
-        raise
-    except Exception as error:
-        logger.exception("Failed to store transcription upload")
-        raise HTTPException(status_code=500, detail=str(error))
+    for upload in files:
+        original_filename = upload.filename or f"{uuid.uuid4()}.mkv"
+        item = metadata_by_filename.get(original_filename)
+        if not item:
+            raise HTTPException(status_code=400, detail=f"Missing participant metadata for {original_filename}")
+        destination = job_audio_dir / Path(original_filename).name
+        with destination.open("wb") as output:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+        await upload.close()
+        tracks.append({
+            "path": str(destination),
+            "filename": original_filename,
+            "participant_id": item["participant_id"],
+            "speaker_name": item.get("speaker_name"),
+        })
 
     job = {
         "job_id": job_id,
         "meeting_id": meeting_id,
         "recording_id": recording_id,
-        "created_at": utc_now(),
+        "created_at": None,
         "status": "queued",
         "tracks": tracks,
         "output_dir": str(job_output_dir),
@@ -135,81 +143,28 @@ async def create_transcription(
         "text_transcript_path": None,
         "error": None,
     }
-
-    job_path = JOBS_DIR / f"{job_id}.json"
-    with job_path.open("w", encoding="utf-8") as file:
-        json.dump(job, file, indent=2, ensure_ascii=False)
-
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "meeting_id": meeting_id,
-        "recording_id": recording_id,
-    }
+    path = JOBS_DIR / f"{job_id}.json"
+    path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+    return {"job_id": job_id, "status": "queued", "meeting_id": meeting_id, "recording_id": recording_id}
 
 
 @app.get("/v1/transcriptions/{job_id}")
-def get_transcription_status(
-    job_id: str,
-    authorization: str | None = Header(default=None),
-):
-    verify_api_key(authorization)
-    job_path = JOBS_DIR / f"{job_id}.json"
-    if not job_path.exists():
+def get_transcription_status(job_id: str):
+    path = JOBS_DIR / f"{job_id}.json"
+    if not path.exists():
         raise HTTPException(status_code=404, detail="Job not found")
-    with job_path.open("r", encoding="utf-8") as file:
-        return json.load(file)
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @app.get("/v1/transcriptions/{job_id}/transcript")
-def download_transcript(
-    job_id: str,
-    authorization: str | None = Header(default=None),
-):
-    verify_api_key(authorization)
+def download_transcript(job_id: str):
     job_path = JOBS_DIR / f"{job_id}.json"
     if not job_path.exists():
         raise HTTPException(status_code=404, detail="Job not found")
-
-    with job_path.open("r", encoding="utf-8") as file:
-        job = json.load(file)
-
+    job = json.loads(job_path.read_text(encoding="utf-8"))
     if job.get("status") != "completed":
         raise HTTPException(status_code=409, detail="Transcription is not completed")
-
-    transcript_path = Path(job["transcript_path"])
-    if not transcript_path.exists():
+    path = Path(job["transcript_path"])
+    if not path.exists():
         raise HTTPException(status_code=404, detail="Transcript file missing")
-
-    return FileResponse(
-        path=transcript_path,
-        media_type="application/json",
-        filename="transcript.json",
-    )
-
-
-@app.get("/v1/transcriptions/{job_id}/text")
-def download_text_transcript(
-    job_id: str,
-    authorization: str | None = Header(default=None),
-):
-    verify_api_key(authorization)
-    job_path = JOBS_DIR / f"{job_id}.json"
-    if not job_path.exists():
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    with job_path.open("r", encoding="utf-8") as file:
-        job = json.load(file)
-
-    if job.get("status") != "completed":
-        raise HTTPException(status_code=409, detail="Transcription is not completed")
-
-    transcript_path = Path(job["text_transcript_path"])
-    if not transcript_path.exists():
-        raise HTTPException(status_code=404, detail="Transcript file missing")
-
-    return FileResponse(
-        path=transcript_path,
-        media_type="text/plain",
-        filename="transcript.txt",
-    )
+    return FileResponse(path=path, media_type="application/json", filename="transcript.json")
