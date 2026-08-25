@@ -2,27 +2,43 @@ services:
   - type: web
     name: defcomm-ai
     runtime: python
+
     buildCommand: pip install -r requirements.txt
+
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+
     healthCheckPath: /health
+
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+
       - key: WHISPER_MODEL
         value: small
+
       - key: WHISPER_DEVICE
         value: cpu
+
       - key: WHISPER_COMPUTE_TYPE
         value: int8
+
       - key: WHISPER_BEAM_SIZE
         value: "5"
+
+      - key: WHISPER_VAD_FILTER
+        value: "true"
+
       - key: DATA_DIR
-        value: /var/data
+        value: /tmp/defcomm-ai
+
+      - key: HF_HOME
+        value: /tmp/huggingface
+
+      - key: HF_HUB_CACHE
+        value: /tmp/huggingface/hub
+
       - key: MAX_UPLOAD_BYTES
         value: "2147483648"
+
       - key: AI_API_KEY
         sync: false
-    disk:
-      name: defcomm-ai-data
-      mountPath: /var/data
-      sizeGB: 10

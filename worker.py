@@ -1,10 +1,4 @@
-import json
-import logging
-import threading
-import time
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
+
 import os
 
 os.environ.setdefault(
@@ -17,6 +11,14 @@ os.environ.setdefault(
     "/tmp/huggingface/hub",
 )
 
+
+import json
+import logging
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 from faster_whisper import WhisperModel
 

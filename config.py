@@ -7,6 +7,8 @@ APP_NAME = os.getenv(
     "DefComm AI",
 )
 
+# Render Free does not provide a persistent disk.
+# Use /tmp for temporary model/audio/job storage.
 DATA_DIR = Path(
     os.getenv(
         "DATA_DIR",
@@ -17,6 +19,7 @@ DATA_DIR = Path(
 JOBS_DIR = DATA_DIR / "jobs"
 AUDIO_DIR = DATA_DIR / "audio"
 OUTPUT_DIR = DATA_DIR / "outputs"
+MODEL_DIR = DATA_DIR / "models"
 
 
 WHISPER_MODEL = os.getenv(
@@ -41,6 +44,15 @@ WHISPER_BEAM_SIZE = int(
     )
 )
 
+WHISPER_VAD_FILTER = (
+    os.getenv(
+        "WHISPER_VAD_FILTER",
+        "true",
+    ).lower()
+    == "true"
+)
+
+
 AI_API_KEY = os.getenv(
     "AI_API_KEY",
     "",
@@ -53,6 +65,13 @@ WORKER_POLL_SECONDS = float(
     )
 )
 
+MAX_UPLOAD_BYTES = int(
+    os.getenv(
+        "MAX_UPLOAD_BYTES",
+        str(2 * 1024 * 1024 * 1024),
+    )
+)
+
 
 def ensure_directories() -> None:
     for directory in (
@@ -60,6 +79,7 @@ def ensure_directories() -> None:
         JOBS_DIR,
         AUDIO_DIR,
         OUTPUT_DIR,
+        MODEL_DIR,
     ):
         directory.mkdir(
             parents=True,
