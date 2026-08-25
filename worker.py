@@ -5,6 +5,18 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import os
+
+os.environ.setdefault(
+    "HF_HOME",
+    "/tmp/huggingface",
+)
+
+os.environ.setdefault(
+    "HF_HUB_CACHE",
+    "/tmp/huggingface/hub",
+)
+
 
 from faster_whisper import WhisperModel
 
