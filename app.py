@@ -2,10 +2,11 @@ import json
 import logging
 import uuid
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from config import (
     AI_API_KEY,
@@ -15,12 +16,13 @@ from config import (
     APP_NAME,
     ensure_directories,
 )
+from summarizer import summarize_meeting
 from worker import start_worker, transcribe_audio
 
 logger = logging.getLogger("defcomm-ai")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=APP_NAME, version="1.1.0")
+app = FastAPI(title=APP_NAME, version="1.3.0")
 
 
 def verify_api_key(authorization: str | None = None):
@@ -41,11 +43,8 @@ def startup() -> None:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP_NAME}
+    return {"ok": True, "service": APP_NAME, "summary_model": __import__("summarizer").SUMMARY_MODEL}
 
-
-# Actual implementation using a Request keeps multipart and Authorization clean.
-from fastapi import Request
 
 @app.post("/v1/live/transcribe")
 async def live_transcribe(
@@ -101,9 +100,11 @@ async def create_transcription(
         raise HTTPException(status_code=400, detail="metadata must be a JSON array")
 
     metadata_by_filename = {
-        item["filename"]: item for item in metadata_items
+        item["filename"]: item
+        for item in metadata_items
         if isinstance(item, dict) and "filename" in item and "participant_id" in item
     }
+
     job_id = str(uuid.uuid4())
     job_audio_dir = AUDIO_DIR / job_id
     job_output_dir = OUTPUT_DIR / job_id
@@ -115,7 +116,11 @@ async def create_transcription(
         original_filename = upload.filename or f"{uuid.uuid4()}.mkv"
         item = metadata_by_filename.get(original_filename)
         if not item:
-            raise HTTPException(status_code=400, detail=f"Missing participant metadata for {original_filename}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing participant metadata for {original_filename}",
+            )
+
         destination = job_audio_dir / Path(original_filename).name
         with destination.open("wb") as output:
             while True:
@@ -124,6 +129,7 @@ async def create_transcription(
                     break
                 output.write(chunk)
         await upload.close()
+
         tracks.append({
             "path": str(destination),
             "filename": original_filename,
@@ -143,9 +149,15 @@ async def create_transcription(
         "text_transcript_path": None,
         "error": None,
     }
+
     path = JOBS_DIR / f"{job_id}.json"
     path.write_text(json.dumps(job, indent=2), encoding="utf-8")
-    return {"job_id": job_id, "status": "queued", "meeting_id": meeting_id, "recording_id": recording_id}
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "meeting_id": meeting_id,
+        "recording_id": recording_id,
+    }
 
 
 @app.get("/v1/transcriptions/{job_id}")
@@ -161,10 +173,62 @@ def download_transcript(job_id: str):
     job_path = JOBS_DIR / f"{job_id}.json"
     if not job_path.exists():
         raise HTTPException(status_code=404, detail="Job not found")
+
     job = json.loads(job_path.read_text(encoding="utf-8"))
     if job.get("status") != "completed":
         raise HTTPException(status_code=409, detail="Transcription is not completed")
+
     path = Path(job["transcript_path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="Transcript file missing")
+
     return FileResponse(path=path, media_type="application/json", filename="transcript.json")
+
+
+class ImportantMoment(BaseModel):
+    timestamp_ms: int | None = None
+    title: str | None = None
+    description: str | None = None
+
+
+class SummarySegment(BaseModel):
+    speaker_id: str | None = None
+    speaker_name: str | None = None
+    sequence: int | None = None
+    text: str
+    start_ms: int | None = None
+    end_ms: int | None = None
+
+
+class MeetingSummaryRequest(BaseModel):
+    meeting_id: str
+    session_id: str | None = None
+    segments: list[SummarySegment] = Field(default_factory=list)
+
+
+@app.post("/v1/meeting/summarize")
+def summarize_meeting_endpoint(
+    request: Request,
+    payload: MeetingSummaryRequest,
+):
+    verify_api_key(request.headers.get("authorization"))
+
+    segments: list[dict[str, Any]] = [item.model_dump() for item in payload.segments]
+    logger.info(
+        "Generating local meeting summary meeting=%s session=%s segments=%s",
+        payload.meeting_id,
+        payload.session_id,
+        len(segments),
+    )
+
+    try:
+        summary = summarize_meeting(segments)
+    except Exception as error:
+        logger.exception("Local meeting summary generation failed")
+        raise HTTPException(status_code=500, detail=f"summary generation failed: {error}") from error
+
+    return {
+        "meeting_id": payload.meeting_id,
+        "session_id": payload.session_id,
+        "summary": summary,
+    }

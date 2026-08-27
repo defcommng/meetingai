@@ -16,7 +16,6 @@ WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "true").lower() == "true"
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 WORKER_POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "2"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
-
 HF_HOME = os.getenv("HF_HOME", "/tmp/huggingface")
 HF_HUB_CACHE = os.getenv("HF_HUB_CACHE", "/tmp/huggingface/hub")
 

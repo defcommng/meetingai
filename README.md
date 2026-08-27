@@ -1,27 +1,60 @@
-# DefComm AI transcription service
+# DefComm AI Worker
 
-This service runs faster-whisper locally and accepts participant-level microphone recordings from the DefComm SFU.
+Local speech-to-text and local meeting summarization service for DefComm.
 
-## Render
+## Models
 
-Create a Python Web Service from this directory. Attach a persistent disk at `/var/data`.
+- Whisper: `faster-whisper` for speech-to-text.
+- Summary: `google/flan-t5-small` by default, loaded locally through Hugging Face Transformers.
 
-Required environment variables:
+No OpenAI/Anthropic/Gemini API key is required for meeting summaries.
 
-- `AI_API_KEY` - long random secret shared with the SFU.
-- `WHISPER_MODEL=small`
-- `WHISPER_DEVICE=cpu`
-- `WHISPER_COMPUTE_TYPE=int8`
-- `DATA_DIR=/var/data`
+## Required environment
 
-The first startup downloads the Whisper model into `/var/data/models` so the persistent disk can retain it across restarts.
+```env
+AI_API_KEY=replace-with-a-long-random-secret
+WHISPER_MODEL=small
+WHISPER_DEVICE=cpu
+WHISPER_COMPUTE_TYPE=int8
+DATA_DIR=/var/data
+WHISPER_MODEL_CACHE=/var/data/models
+SUMMARY_MODEL_CACHE=/var/data/models
+HF_HOME=/var/data/huggingface
+HF_HUB_CACHE=/var/data/huggingface/hub
+```
 
-## Endpoints
+## Summary settings
 
-- `GET /health`
-- `POST /v1/transcriptions`
-- `GET /v1/transcriptions/{job_id}`
-- `GET /v1/transcriptions/{job_id}/transcript`
-- `GET /v1/transcriptions/{job_id}/text`
+```env
+SUMMARY_MODEL=google/flan-t5-small
+SUMMARY_MAX_INPUT_TOKENS=1800
+SUMMARY_MAX_NEW_TOKENS=384
+SUMMARY_NUM_BEAMS=2
+SUMMARY_CHUNK_CHARS=7000
+```
 
-The SFU submits each participant microphone `.mkv` as a separate file with metadata containing `participant_id` and `speaker_name`.
+The summary route accepts the final speaker-attributed transcript from the SFU:
+
+```text
+POST /v1/meeting/summarize
+Authorization: Bearer <AI_API_KEY>
+Content-Type: application/json
+```
+
+Response:
+
+```json
+{
+  "meeting_id": "...",
+  "session_id": "...",
+  "summary": {
+    "overview": "...",
+    "topics": [],
+    "decisions": [],
+    "action_items": [],
+    "important_moments": []
+  }
+}
+```
+
+The model runs on the same service as Whisper. CPU-only inference can be slow for long meetings, so use persistent storage for model caches and give the Railway service enough RAM/CPU.

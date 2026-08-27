@@ -2,43 +2,43 @@ services:
   - type: web
     name: defcomm-ai
     runtime: python
-
     buildCommand: pip install -r requirements.txt
-
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
-
     healthCheckPath: /health
-
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-
       - key: WHISPER_MODEL
         value: small
-
       - key: WHISPER_DEVICE
         value: cpu
-
       - key: WHISPER_COMPUTE_TYPE
         value: int8
-
       - key: WHISPER_BEAM_SIZE
-        value: "5"
-
+        value: "3"
       - key: WHISPER_VAD_FILTER
         value: "true"
-
+      - key: SUMMARY_MODEL
+        value: google/flan-t5-small
+      - key: SUMMARY_MAX_INPUT_TOKENS
+        value: "1800"
+      - key: SUMMARY_MAX_NEW_TOKENS
+        value: "384"
+      - key: SUMMARY_NUM_BEAMS
+        value: "2"
+      - key: SUMMARY_CHUNK_CHARS
+        value: "7000"
       - key: DATA_DIR
-        value: /tmp/defcomm-ai
-
+        value: /var/data
+      - key: WHISPER_MODEL_CACHE
+        value: /var/data/models
+      - key: SUMMARY_MODEL_CACHE
+        value: /var/data/models
       - key: HF_HOME
-        value: /tmp/huggingface
-
+        value: /var/data/huggingface
       - key: HF_HUB_CACHE
-        value: /tmp/huggingface/hub
-
+        value: /var/data/huggingface/hub
       - key: MAX_UPLOAD_BYTES
         value: "2147483648"
-
       - key: AI_API_KEY
         sync: false
