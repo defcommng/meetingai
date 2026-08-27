@@ -18,16 +18,18 @@ services:
         value: "3"
       - key: WHISPER_VAD_FILTER
         value: "true"
+      - key: SUMMARY_ENABLED
+        value: "true"
       - key: SUMMARY_MODEL
         value: google/flan-t5-small
       - key: SUMMARY_MAX_INPUT_TOKENS
         value: "1800"
       - key: SUMMARY_MAX_NEW_TOKENS
-        value: "384"
+        value: "256"
       - key: SUMMARY_NUM_BEAMS
         value: "2"
       - key: SUMMARY_CHUNK_CHARS
-        value: "7000"
+        value: "6000"
       - key: DATA_DIR
         value: /var/data
       - key: WHISPER_MODEL_CACHE
@@ -38,6 +40,14 @@ services:
         value: /var/data/huggingface
       - key: HF_HUB_CACHE
         value: /var/data/huggingface/hub
+      - key: WORKER_POLL_SECONDS
+        value: "2"
+      - key: WORKER_STALE_SECONDS
+        value: "21600"
+      - key: UNLOAD_WHISPER_BEFORE_SUMMARY
+        value: "true"
+      - key: MODEL_WARMUP
+        value: "false"
       - key: MAX_UPLOAD_BYTES
         value: "2147483648"
       - key: AI_API_KEY

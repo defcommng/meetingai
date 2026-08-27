@@ -1,10 +1,23 @@
-# Post-meeting batch transcription changes
+# DefComm AI — post-meeting transcription and summary
 
-`POST /v1/transcriptions` is the production transcription path. Multiple microphone recordings can be
-uploaded in one request with per-track metadata including `offset_ms`, `participant_id`, and `speaker_name`.
+The AI service is intentionally **post-meeting**. There is no live transcription path and no WebSocket dependency.
 
-The worker adds each track's offset to Whisper's track-local timestamps before merging all speakers into
-a single meeting timeline.
+## Flow
 
-The live `/v1/live/transcribe` HTTP endpoint and `/v1/live/transcribe/ws` WebSocket may remain for backwards
-compatibility, but the SFU no longer depends on either for meeting transcription.
+1. SFU uploads the completed microphone recordings to `POST /v1/transcriptions`.
+2. The AI worker queues the job and immediately returns a `job_id`.
+3. The worker transcribes every uploaded track with Whisper and merges the track-local timestamps using `offset_ms`.
+4. The worker writes `transcript.json` and `transcript.txt`.
+5. The worker generates a local summary and writes `summary.json`.
+6. SFU can poll `GET /v1/transcriptions/{job_id}` or fetch the result files directly.
+
+## Endpoints
+
+- `GET /health`
+- `POST /v1/transcriptions`
+- `GET /v1/transcriptions/{job_id}`
+- `GET /v1/transcriptions/{job_id}/transcript`
+- `GET /v1/transcriptions/{job_id}/summary`
+- `POST /v1/transcriptions/{job_id}/retry`
+
+The old `/v1/live/transcribe` endpoint is intentionally removed.

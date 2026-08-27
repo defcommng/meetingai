@@ -1,37 +1,40 @@
 import json
 import logging
+import threading
 import uuid
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
 
 from config import (
     AI_API_KEY,
+    APP_NAME,
     AUDIO_DIR,
     JOBS_DIR,
-    OUTPUT_DIR,
-    APP_NAME,
     MODEL_WARMUP,
+    OUTPUT_DIR,
+    MAX_UPLOAD_BYTES,
+    SUMMARY_ENABLED,
     ensure_directories,
 )
-from summarizer import summarize_meeting
-from worker import get_whisper_model, start_worker, transcribe_audio
+from summarizer import SUMMARY_MODEL, _load_model
+from worker import get_whisper_model, start_worker
 
 logger = logging.getLogger("defcomm-ai")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=APP_NAME, version="1.3.0")
+app = FastAPI(title=APP_NAME, version="2.0.0")
 
 
-def verify_api_key(authorization: str | None = None):
+def verify_api_key(authorization: str | None) -> None:
     if not AI_API_KEY:
         return
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
-    if authorization.removeprefix("Bearer ") != AI_API_KEY:
+    supplied = authorization.removeprefix("Bearer ")
+    if supplied != AI_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid AI service API key")
 
 
@@ -40,21 +43,15 @@ def startup() -> None:
     ensure_directories()
     start_worker()
 
-    # Never block application startup on multi-gigabyte model loading.
-    # Railway's /health endpoint can respond immediately. Set MODEL_WARMUP=true
-    # only when you explicitly want a background warmup after startup.
     if MODEL_WARMUP:
-        import threading
-
         def warm_models() -> None:
             try:
                 get_whisper_model()
-                # Import is intentionally local so the summary model is also lazy.
-                from summarizer import _load_model
-                _load_model()
+                if SUMMARY_ENABLED:
+                    _load_model()
                 logger.info("AI models warmed successfully")
             except Exception:
-                logger.exception("AI model warmup failed; models remain lazy-loaded")
+                logger.exception("AI model warmup failed; lazy loading remains enabled")
 
         threading.Thread(
             target=warm_models,
@@ -66,53 +63,20 @@ def startup() -> None:
 
 
 @app.get("/health")
-def health():
-    # Lightweight liveness check: do not load Whisper or the summary model here.
-    from summarizer import SUMMARY_MODEL
+def health() -> dict:
+    from worker import _model as whisper_model
+    from summarizer import _model as summary_model
 
     return {
         "ok": True,
         "service": APP_NAME,
+        "version": "2.0.0",
+        "mode": "post-meeting",
+        "summary_enabled": SUMMARY_ENABLED,
         "summary_model": SUMMARY_MODEL,
-        "whisper_loaded": __import__("worker")._model is not None,
+        "whisper_loaded": whisper_model is not None,
+        "summary_loaded": summary_model is not None,
     }
-
-
-@app.post("/v1/live/transcribe")
-async def live_transcribe(
-    request: Request,
-    audio: Annotated[UploadFile, File()],
-    meeting_id: Annotated[str, Form()],
-    participant_id: Annotated[str, Form()],
-    speaker_name: Annotated[str, Form()] = "Participant",
-    sequence: Annotated[int, Form()] = 0,
-    offset_ms: Annotated[str, Form()] = "",
-):
-    verify_api_key(request.headers.get("authorization"))
-
-    data = await audio.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty audio chunk")
-    if len(data) > 5 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Audio chunk exceeds 5 MB")
-
-    suffix = Path(audio.filename or "live-audio.webm").suffix or ".webm"
-    temp = AUDIO_DIR / f"live-{uuid.uuid4()}{suffix}"
-    temp.write_bytes(data)
-
-    try:
-        result = transcribe_audio(temp)
-        return {
-            "meeting_id": meeting_id,
-            "participant_id": participant_id,
-            "speaker_name": speaker_name,
-            "sequence": sequence,
-            "offset_ms": int(offset_ms) if offset_ms else None,
-            "text": result["text"],
-            "segments": result["segments"],
-        }
-    finally:
-        temp.unlink(missing_ok=True)
 
 
 @app.post("/v1/transcriptions")
@@ -124,17 +88,20 @@ async def create_transcription(
     files: Annotated[list[UploadFile], File()],
 ):
     verify_api_key(request.headers.get("authorization"))
+
     try:
         metadata_items = json.loads(metadata)
         if not isinstance(metadata_items, list):
             raise ValueError
-    except Exception:
-        raise HTTPException(status_code=400, detail="metadata must be a JSON array")
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="metadata must be a JSON array") from error
 
     metadata_by_filename = {
         item["filename"]: item
         for item in metadata_items
-        if isinstance(item, dict) and "filename" in item and "participant_id" in item
+        if isinstance(item, dict)
+        and "filename" in item
+        and "participant_id" in item
     }
 
     job_id = str(uuid.uuid4())
@@ -142,33 +109,57 @@ async def create_transcription(
     job_output_dir = OUTPUT_DIR / job_id
     job_audio_dir.mkdir(parents=True, exist_ok=True)
     job_output_dir.mkdir(parents=True, exist_ok=True)
-    tracks = []
 
-    for upload in files:
-        original_filename = upload.filename or f"{uuid.uuid4()}.mkv"
-        item = metadata_by_filename.get(original_filename)
-        if not item:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Missing participant metadata for {original_filename}",
-            )
+    tracks: list[dict] = []
+    total_bytes = 0
 
-        destination = job_audio_dir / Path(original_filename).name
-        with destination.open("wb") as output:
-            while True:
-                chunk = await upload.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
-        await upload.close()
+    try:
+        for upload in files:
+            original_filename = upload.filename or f"{uuid.uuid4()}.mkv"
+            item = metadata_by_filename.get(original_filename)
+            if not item:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing participant metadata for {original_filename}",
+                )
 
-        tracks.append({
-            "path": str(destination),
-            "filename": original_filename,
-            "participant_id": item["participant_id"],
-            "speaker_name": item.get("speaker_name"),
-            "offset_ms": int(item.get("offset_ms") or 0),
-        })
+            safe_filename = Path(original_filename).name
+            destination = job_audio_dir / safe_filename
+
+            written = 0
+            with destination.open("wb") as output:
+                while True:
+                    chunk = await upload.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_UPLOAD_BYTES:
+                        raise HTTPException(status_code=413, detail="Upload exceeds configured size limit")
+                    output.write(chunk)
+            await upload.close()
+
+            if written == 0:
+                raise HTTPException(status_code=400, detail=f"Empty media file: {original_filename}")
+
+            tracks.append({
+                "path": str(destination),
+                "filename": original_filename,
+                "participant_id": str(item["participant_id"]),
+                "speaker_name": item.get("speaker_name") or item.get("participant_name"),
+                "offset_ms": int(item.get("offset_ms") or 0),
+            })
+
+    except Exception:
+        # Do not leave half-created jobs around when upload validation fails.
+        for path in job_audio_dir.glob("*"):
+            path.unlink(missing_ok=True)
+        job_audio_dir.rmdir()
+        job_output_dir.rmdir()
+        raise
+
+    if not tracks:
+        raise HTTPException(status_code=400, detail="At least one media file is required")
 
     job = {
         "job_id": job_id,
@@ -176,18 +167,22 @@ async def create_transcription(
         "recording_id": recording_id,
         "created_at": None,
         "status": "queued",
+        "stage": "queued",
         "tracks": tracks,
         "output_dir": str(job_output_dir),
         "transcript_path": None,
         "text_transcript_path": None,
+        "summary_path": None,
         "error": None,
     }
 
-    path = JOBS_DIR / f"{job_id}.json"
-    path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+    job_path = JOBS_DIR / f"{job_id}.json"
+    job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+
     return {
         "job_id": job_id,
         "status": "queued",
+        "stage": "queued",
         "meeting_id": meeting_id,
         "recording_id": recording_id,
     }
@@ -208,60 +203,57 @@ def download_transcript(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = json.loads(job_path.read_text(encoding="utf-8"))
-    if job.get("status") != "completed":
-        raise HTTPException(status_code=409, detail="Transcription is not completed")
+    path_value = job.get("transcript_path")
+    if not path_value:
+        raise HTTPException(status_code=409, detail="Transcript is not available")
 
-    path = Path(job["transcript_path"])
+    path = Path(path_value)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Transcript file missing")
 
     return FileResponse(path=path, media_type="application/json", filename="transcript.json")
 
 
-class ImportantMoment(BaseModel):
-    timestamp_ms: int | None = None
-    title: str | None = None
-    description: str | None = None
+@app.get("/v1/transcriptions/{job_id}/summary")
+def download_summary(job_id: str):
+    job_path = JOBS_DIR / f"{job_id}.json"
+    if not job_path.exists():
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = json.loads(job_path.read_text(encoding="utf-8"))
+    path_value = job.get("summary_path")
+    if not path_value:
+        raise HTTPException(status_code=409, detail="Summary is not available")
+
+    path = Path(path_value)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Summary file missing")
+
+    return FileResponse(path=path, media_type="application/json", filename="summary.json")
 
 
-class SummarySegment(BaseModel):
-    speaker_id: str | None = None
-    speaker_name: str | None = None
-    sequence: int | None = None
-    text: str
-    start_ms: int | None = None
-    end_ms: int | None = None
-
-
-class MeetingSummaryRequest(BaseModel):
-    meeting_id: str
-    session_id: str | None = None
-    segments: list[SummarySegment] = Field(default_factory=list)
-
-
-@app.post("/v1/meeting/summarize")
-def summarize_meeting_endpoint(
-    request: Request,
-    payload: MeetingSummaryRequest,
-):
+@app.post("/v1/transcriptions/{job_id}/retry")
+def retry_failed_transcription(job_id: str, request: Request):
     verify_api_key(request.headers.get("authorization"))
 
-    segments: list[dict[str, Any]] = [item.model_dump() for item in payload.segments]
-    logger.info(
-        "Generating local meeting summary meeting=%s session=%s segments=%s",
-        payload.meeting_id,
-        payload.session_id,
-        len(segments),
-    )
+    path = JOBS_DIR / f"{job_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Job not found")
 
-    try:
-        summary = summarize_meeting(segments)
-    except Exception as error:
-        logger.exception("Local meeting summary generation failed")
-        raise HTTPException(status_code=500, detail=f"summary generation failed: {error}") from error
+    job = json.loads(path.read_text(encoding="utf-8"))
+    if job.get("status") not in {"failed", "completed"}:
+        raise HTTPException(status_code=409, detail=f"Cannot retry job in state {job.get('status')}")
 
-    return {
-        "meeting_id": payload.meeting_id,
-        "session_id": payload.session_id,
-        "summary": summary,
-    }
+    # Retry the exact same uploaded files. This is useful for summary-only
+    # failures too, because the worker can rebuild transcript and summary safely.
+    job.update({
+        "status": "queued",
+        "stage": "queued",
+        "error": None,
+        "retry_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+        "completed_at": None,
+        "summary_path": None,
+    })
+    path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+
+    return {"job_id": job_id, "status": "queued", "stage": "queued"}
