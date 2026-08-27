@@ -14,6 +14,7 @@ from faster_whisper import WhisperModel
 
 from config import (
     JOBS_DIR,
+    LIVE_JOBS_DIR,
     WHISPER_BEAM_SIZE,
     WHISPER_COMPUTE_TYPE,
     WHISPER_DEVICE,
@@ -23,21 +24,13 @@ from config import (
 )
 
 logger = logging.getLogger("defcomm-ai-worker")
-
-logger.info(
-    "Loading Whisper model=%s device=%s compute_type=%s",
-    WHISPER_MODEL,
-    WHISPER_DEVICE,
-    WHISPER_COMPUTE_TYPE,
-)
-
+logger.info("Loading Whisper model=%s device=%s compute_type=%s", WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE)
 model = WhisperModel(
     WHISPER_MODEL,
     device=WHISPER_DEVICE,
     compute_type=WHISPER_COMPUTE_TYPE,
     download_root=os.getenv("WHISPER_MODEL_CACHE", "/tmp/defcomm-ai/models"),
 )
-
 model_lock = threading.Lock()
 logger.info("Whisper model loaded successfully")
 
@@ -66,19 +59,11 @@ def transcribe_audio(path: Path) -> dict[str, Any]:
             vad_filter=WHISPER_VAD_FILTER,
             condition_on_previous_text=False,
         )
-
         items = []
         for segment in segments:
             text = segment.text.strip()
             if text:
-                items.append(
-                    {
-                        "start": float(segment.start),
-                        "end": float(segment.end),
-                        "text": text,
-                    }
-                )
-
+                items.append({"start": float(segment.start), "end": float(segment.end), "text": text})
     return {
         "language": info.language,
         "language_probability": float(info.language_probability),
@@ -88,17 +73,43 @@ def transcribe_audio(path: Path) -> dict[str, Any]:
     }
 
 
+def process_live_job(job_path: Path) -> None:
+    job = read_json(job_path)
+    if job.get("status") != "queued":
+        return
+    job["status"] = "processing"
+    job["started_at"] = utc_now()
+    job["error"] = None
+    write_json(job_path, job)
+    audio_path = Path(job["audio_path"])
+    try:
+        result = transcribe_audio(audio_path)
+        job.update({
+            "status": "completed",
+            "completed_at": utc_now(),
+            "text": result["text"],
+            "segments": result["segments"],
+            "language": result.get("language"),
+            "error": None,
+        })
+        write_json(job_path, job)
+    except Exception as error:
+        logger.exception("Live job %s failed", job["job_id"])
+        job.update({"status": "failed", "completed_at": utc_now(), "error": str(error)})
+        write_json(job_path, job)
+    finally:
+        audio_path.unlink(missing_ok=True)
+
+
 def process_job(job_path: Path) -> None:
     job = read_json(job_path)
     job["status"] = "processing"
     job["started_at"] = utc_now()
     job["error"] = None
     write_json(job_path, job)
-
     try:
         all_segments = []
         languages = []
-
         for track in job["tracks"]:
             result = transcribe_audio(Path(track["path"]))
             if result.get("language"):
@@ -111,11 +122,9 @@ def process_job(job_path: Path) -> None:
                     "speaker_name": track.get("speaker_name"),
                     "text": segment["text"],
                 })
-
         all_segments.sort(key=lambda item: (item["start"], item["end"]))
         output_dir = Path(job["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
-
         transcript = {
             "version": 1,
             "job_id": job["job_id"],
@@ -127,16 +136,11 @@ def process_job(job_path: Path) -> None:
         }
         transcript_path = output_dir / "transcript.json"
         write_json(transcript_path, transcript)
-
         text_path = output_dir / "transcript.txt"
         with text_path.open("w", encoding="utf-8") as file:
             for segment in all_segments:
                 speaker = segment.get("speaker_name") or segment["speaker_id"]
-                file.write(
-                    f"[{segment['start']:.2f} - {segment['end']:.2f}] "
-                    f"{speaker}: {segment['text']}\n"
-                )
-
+                file.write(f"[{segment['start']:.2f} - {segment['end']:.2f}] {speaker}: {segment['text']}\n")
         job.update({
             "status": "completed",
             "completed_at": utc_now(),
@@ -164,10 +168,25 @@ def get_queued_jobs() -> list[Path]:
     return sorted(jobs, key=lambda path: path.stat().st_mtime)
 
 
+def get_queued_live_jobs() -> list[Path]:
+    jobs = []
+    for path in LIVE_JOBS_DIR.glob("*.json"):
+        try:
+            if read_json(path).get("status") == "queued":
+                jobs.append(path)
+        except Exception:
+            continue
+    return sorted(jobs, key=lambda path: path.stat().st_mtime)
+
+
 def worker_loop() -> None:
     logger.info("Worker loop started")
     while True:
         try:
+            live_jobs = get_queued_live_jobs()
+            if live_jobs:
+                process_live_job(live_jobs[0])
+                continue
             jobs = get_queued_jobs()
             if jobs:
                 process_job(jobs[0])
