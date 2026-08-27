@@ -1,10 +1,13 @@
 import json
+import asyncio
 import logging
 import uuid
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -77,6 +80,166 @@ def health():
         "whisper_loaded": __import__("worker")._model is not None,
     }
 
+
+
+
+def verify_websocket_api_key(websocket: WebSocket) -> None:
+    if not AI_API_KEY:
+        return
+    authorization = websocket.headers.get("authorization")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    if authorization.removeprefix("Bearer ") != AI_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid AI service API key")
+
+
+@app.websocket("/v1/live/transcribe/ws")
+async def live_transcribe_websocket(websocket: WebSocket):
+    """Persistent SFU -> AI live transcription stream.
+
+    Protocol:
+      1. SFU connects with Authorization: Bearer <AI_API_KEY>.
+      2. SFU sends JSON session.start.
+      3. For each chunk SFU sends JSON {type: audio, sequence, offset_ms} followed
+         by one binary WebM/Ogg/Opus payload.
+      4. AI returns {type: transcript, sequence, result: {...}}.
+      5. SFU sends JSON session.stop and closes the socket.
+    """
+    try:
+        verify_websocket_api_key(websocket)
+        await websocket.accept()
+
+        first = await websocket.receive_json()
+        if first.get("type") != "session.start":
+            await websocket.send_json({
+                "type": "error",
+                "message": "first message must be session.start",
+            })
+            await websocket.close(code=1008)
+            return
+
+        meeting_id = str(first.get("meeting_id", ""))
+        participant_id = str(first.get("participant_id", ""))
+        speaker_name = str(first.get("speaker_name") or "Participant")
+
+        if not meeting_id or not participant_id:
+            await websocket.send_json({
+                "type": "error",
+                "message": "meeting_id and participant_id are required",
+            })
+            await websocket.close(code=1008)
+            return
+
+        await websocket.send_json({
+            "type": "session.ready",
+            "meeting_id": meeting_id,
+            "participant_id": participant_id,
+        })
+
+        logger.info(
+            "Live transcription WebSocket connected meeting=%s participant=%s speaker=%s",
+            meeting_id,
+            participant_id,
+            speaker_name,
+        )
+
+        while True:
+            message = await websocket.receive()
+
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect
+
+            text = message.get("text")
+            if text is not None:
+                try:
+                    control = json.loads(text)
+                except json.JSONDecodeError:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "invalid JSON control message",
+                    })
+                    continue
+
+                message_type = control.get("type")
+                if message_type == "session.stop":
+                    await websocket.send_json({"type": "session.stopped"})
+                    break
+                if message_type == "ping":
+                    await websocket.send_json({"type": "pong"})
+                    continue
+                if message_type != "audio":
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"unsupported message type: {message_type}",
+                    })
+                    continue
+
+                sequence = int(control.get("sequence", 0))
+                offset_ms = int(control.get("offset_ms", 0))
+                audio_message = await websocket.receive()
+                binary = audio_message.get("bytes")
+                if not binary:
+                    await websocket.send_json({
+                        "type": "error",
+                        "sequence": sequence,
+                        "message": "audio binary frame missing after audio metadata",
+                    })
+                    continue
+
+                suffix = ".ogg" if binary.startswith(b"OggS") else ".webm"
+                temp = AUDIO_DIR / f"live-ws-{uuid.uuid4()}{suffix}"
+                temp.write_bytes(binary)
+                try:
+                    # Whisper is CPU-heavy and protected by a process-global lock.
+                    # Run it off the ASGI event loop so one transcription cannot
+                    # stall WebSocket heartbeats or other sessions.
+                    result = await run_in_threadpool(transcribe_audio, temp)
+                finally:
+                    temp.unlink(missing_ok=True)
+
+                await websocket.send_json({
+                    "type": "transcript",
+                    "sequence": sequence,
+                    "offset_ms": offset_ms,
+                    "meeting_id": meeting_id,
+                    "participant_id": participant_id,
+                    "speaker_name": speaker_name,
+                    "result": result,
+                })
+                continue
+
+            if message.get("bytes") is not None:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "binary audio requires a preceding audio metadata message",
+                })
+
+    except WebSocketDisconnect:
+        logger.info(
+            "Live transcription WebSocket disconnected meeting=%s participant=%s",
+            locals().get("meeting_id", ""),
+            locals().get("participant_id", ""),
+        )
+    except HTTPException as error:
+        # Authentication errors happen before accept; return a normal HTTP-style
+        # close when possible. FastAPI/Starlette may surface this during handshake.
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close(code=1008, reason=str(error.detail))
+    except Exception:
+        logger.exception(
+            "Live transcription WebSocket failed meeting=%s participant=%s",
+            locals().get("meeting_id", ""),
+            locals().get("participant_id", ""),
+        )
+        try:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "live transcription failed",
+                })
+                await websocket.close(code=1011)
+        except Exception:
+            pass
 
 @app.post("/v1/live/transcribe")
 async def live_transcribe(
