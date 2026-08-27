@@ -33,7 +33,6 @@ SUMMARY_NUM_BEAMS=2
 SUMMARY_CHUNK_CHARS=7000
 ```
 
-<<<<<<< HEAD
 The summary route accepts the final speaker-attributed transcript from the SFU:
 
 ```text
@@ -59,11 +58,3 @@ Response:
 ```
 
 The model runs on the same service as Whisper. CPU-only inference can be slow for long meetings, so use persistent storage for model caches and give the Railway service enough RAM/CPU.
-=======
-The SFU submits each participant microphone `.mkv` as a separate file with metadata containing `participant_id` and `speaker_name`.
-
-
-## Meeting summary
-
-The service also exposes `POST /v1/meeting/summarize`. It accepts the finalized speaker-attributed transcript from the SFU and returns structured JSON with `overview`, `topics`, `decisions`, `action_items`, and `important_moments`. Configure an OpenAI-compatible provider with `LLM_API_URL`, `LLM_API_KEY`, and `LLM_MODEL`. The existing `AI_API_KEY` remains the shared service key used by the SFU.
->>>>>>> 5f9135be6ec9b183182d888f46cd5f40350a162e
