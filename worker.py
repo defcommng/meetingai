@@ -122,10 +122,15 @@ def process_job(job_path: Path) -> None:
             result = transcribe_audio(Path(track["path"]))
             if result.get("language"):
                 languages.append(result["language"])
+
+            # Whisper timestamps are relative to this microphone file. Shift
+            # them onto the common meeting timeline before merging speakers.
+            offset_seconds = max(0.0, float(track.get("offset_ms") or 0) / 1000.0)
+
             for segment in result["segments"]:
                 all_segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
+                    "start": offset_seconds + float(segment["start"]),
+                    "end": offset_seconds + float(segment["end"]),
                     "speaker_id": track["participant_id"],
                     "speaker_name": track.get("speaker_name"),
                     "text": segment["text"],
