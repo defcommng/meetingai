@@ -1,6 +1,7 @@
 # Railway startup / healthcheck fix
 
 The worker no longer constructs the Whisper model at module import time.
+The heavy ML worker now runs in a separate supervised process from FastAPI.
 `/health` is intentionally lightweight and returns immediately without loading Whisper or the local summary model.
 
 ## Recommended environment
@@ -39,7 +40,7 @@ Uvicorn starts the FastAPI app first. Railway can then call:
 
 without waiting for Whisper or the summary model.
 
-The first transcription request will lazily load Whisper. The first summary request will lazily load the local summarization model.
+The first transcription request will lazily load Whisper inside the worker process. The summary model is loaded inside that same worker only when a job reaches summarization.
 
 ## Validate locally
 

@@ -1,7 +1,7 @@
 import json
 import logging
-import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
@@ -13,19 +13,19 @@ from config import (
     APP_NAME,
     AUDIO_DIR,
     JOBS_DIR,
-    MODEL_WARMUP,
     OUTPUT_DIR,
     MAX_UPLOAD_BYTES,
     SUMMARY_ENABLED,
+    WORKER_STALE_SECONDS,
     ensure_directories,
 )
-from summarizer import SUMMARY_MODEL, _load_model
-from worker import get_whisper_model, start_worker
+from summarizer import SUMMARY_MODEL
+from worker import start_worker, worker_is_alive, read_json, write_json
 
 logger = logging.getLogger("defcomm-ai")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=APP_NAME, version="2.0.0")
+app = FastAPI(title=APP_NAME, version="2.1.0")
 
 
 def verify_api_key(authorization: str | None) -> None:
@@ -43,39 +43,19 @@ def startup() -> None:
     ensure_directories()
     start_worker()
 
-    if MODEL_WARMUP:
-        def warm_models() -> None:
-            try:
-                get_whisper_model()
-                if SUMMARY_ENABLED:
-                    _load_model()
-                logger.info("AI models warmed successfully")
-            except Exception:
-                logger.exception("AI model warmup failed; lazy loading remains enabled")
-
-        threading.Thread(
-            target=warm_models,
-            name="defcomm-ai-model-warmup",
-            daemon=True,
-        ).start()
-
     logger.info("DefComm AI service started")
 
 
 @app.get("/health")
 def health() -> dict:
-    from worker import _model as whisper_model
-    from summarizer import _model as summary_model
-
     return {
         "ok": True,
         "service": APP_NAME,
-        "version": "2.0.0",
+        "version": "2.1.0",
         "mode": "post-meeting",
         "summary_enabled": SUMMARY_ENABLED,
         "summary_model": SUMMARY_MODEL,
-        "whisper_loaded": whisper_model is not None,
-        "summary_loaded": summary_model is not None,
+        "worker_alive": worker_is_alive(),
     }
 
 
@@ -165,7 +145,8 @@ async def create_transcription(
         "job_id": job_id,
         "meeting_id": meeting_id,
         "recording_id": recording_id,
-        "created_at": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
         "status": "queued",
         "stage": "queued",
         "tracks": tracks,
@@ -193,7 +174,7 @@ def get_transcription_status(job_id: str):
     path = JOBS_DIR / f"{job_id}.json"
     if not path.exists():
         raise HTTPException(status_code=404, detail="Job not found")
-    return json.loads(path.read_text(encoding="utf-8"))
+    return read_json(path)
 
 
 @app.get("/v1/transcriptions/{job_id}/transcript")
@@ -202,7 +183,7 @@ def download_transcript(job_id: str):
     if not job_path.exists():
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job = json.loads(job_path.read_text(encoding="utf-8"))
+    job = read_json(job_path)
     path_value = job.get("transcript_path")
     if not path_value:
         raise HTTPException(status_code=409, detail="Transcript is not available")
@@ -220,7 +201,7 @@ def download_summary(job_id: str):
     if not job_path.exists():
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job = json.loads(job_path.read_text(encoding="utf-8"))
+    job = read_json(job_path)
     path_value = job.get("summary_path")
     if not path_value:
         raise HTTPException(status_code=409, detail="Summary is not available")
@@ -240,20 +221,44 @@ def retry_failed_transcription(job_id: str, request: Request):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job = json.loads(path.read_text(encoding="utf-8"))
-    if job.get("status") not in {"failed", "completed"}:
-        raise HTTPException(status_code=409, detail=f"Cannot retry job in state {job.get('status')}")
+    job = read_json(path)
+    state = job.get("status")
 
-    # Retry the exact same uploaded files. This is useful for summary-only
-    # failures too, because the worker can rebuild transcript and summary safely.
+    # Failed/completed jobs can always be retried. A processing job may only be
+    # retried when it is stale; this prevents two workers from transcribing the
+    # same files concurrently while still recovering jobs abandoned by crashes.
+    if state == "processing":
+        started_at = job.get("started_at")
+        if started_at:
+            try:
+                parsed = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                age = datetime.now(timezone.utc).timestamp() - parsed.timestamp()
+                if age < WORKER_STALE_SECONDS:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Job is still processing (age={int(age)}s); retry is allowed after {WORKER_STALE_SECONDS}s",
+                    )
+            except ValueError:
+                pass
+        else:
+            raise HTTPException(status_code=409, detail="Cannot retry processing job without a start timestamp")
+    elif state not in {"failed", "completed", "queued"}:
+        raise HTTPException(status_code=409, detail=f"Cannot retry job in state {state}")
+
+    now = datetime.now(timezone.utc).isoformat()
     job.update({
         "status": "queued",
         "stage": "queued",
         "error": None,
-        "retry_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+        "retry_at": now,
+        "updated_at": now,
+        "started_at": None,
         "completed_at": None,
         "summary_path": None,
+        "transcript_path": None,
+        "text_transcript_path": None,
     })
-    path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+    write_json(path, job)
 
     return {"job_id": job_id, "status": "queued", "stage": "queued"}
+

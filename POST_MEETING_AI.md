@@ -21,3 +21,10 @@ The AI service is intentionally **post-meeting**. There is no live transcription
 - `POST /v1/transcriptions/{job_id}/retry`
 
 The old `/v1/live/transcribe` endpoint is intentionally removed.
+
+
+## Runtime reliability
+
+The HTTP API and the ML worker run in separate OS processes. Heavy Whisper/summary inference therefore cannot block the FastAPI process or make health/status requests unavailable.
+
+Worker jobs are persisted as JSON files. Processing jobs abandoned by a worker crash are requeued on worker restart; jobs that exceed `WORKER_STALE_SECONDS` are also recovered automatically. The retry endpoint accepts failed/completed jobs and stale processing jobs.

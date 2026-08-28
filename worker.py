@@ -1,6 +1,7 @@
 import gc
 import json
 import logging
+import multiprocessing
 import os
 import threading
 import time
@@ -26,14 +27,18 @@ from config import (
     WHISPER_VAD_FILTER,
     WORKER_POLL_SECONDS,
     WORKER_STALE_SECONDS,
+    MODEL_WARMUP,
 )
-from summarizer import summarize_meeting, unload_model as unload_summary_model
+from summarizer import summarize_meeting, unload_model as unload_summary_model, _load_model
 
 logger = logging.getLogger("defcomm-ai-worker")
 
 _model: WhisperModel | None = None
 _model_lock = threading.Lock()
 _model_load_lock = threading.Lock()
+
+_worker_process: multiprocessing.Process | None = None
+_worker_supervisor: threading.Thread | None = None
 
 
 def get_whisper_model() -> WhisperModel:
@@ -118,6 +123,24 @@ def transcribe_audio(path: Path) -> dict[str, Any]:
     }
 
 
+def _recover_abandoned_jobs() -> None:
+    """Requeue jobs that were left in processing when the worker process died/restarted."""
+    for path in JOBS_DIR.glob("*.json"):
+        try:
+            job = read_json(path)
+            if job.get("status") != "processing":
+                continue
+            job["status"] = "queued"
+            job["stage"] = "queued"
+            job["error"] = "Recovered processing job after worker restart"
+            job["recovered_at"] = utc_now()
+            job["started_at"] = None
+            write_json(path, job)
+            logger.warning("Recovered abandoned processing job %s", job.get("job_id"))
+        except Exception:
+            logger.exception("Failed recovering abandoned job %s", path)
+
+
 def _recover_stale_jobs() -> None:
     now = time.time()
     cutoff = now - WORKER_STALE_SECONDS
@@ -137,8 +160,10 @@ def _recover_stale_jobs() -> None:
                 continue
 
             job["status"] = "queued"
-            job["error"] = "Recovered stale processing job after worker restart"
+            job["stage"] = "queued"
+            job["error"] = "Recovered stale processing job after worker timeout"
             job["recovered_at"] = utc_now()
+            job["started_at"] = None
             write_json(path, job)
             logger.warning("Recovered stale job %s", job.get("job_id"))
         except Exception:
@@ -192,8 +217,11 @@ def process_job(job_path: Path) -> None:
     job = read_json(job_path)
     job["status"] = "processing"
     job["started_at"] = utc_now()
+    job["updated_at"] = utc_now()
     job["error"] = None
     job["stage"] = "transcribing"
+    job["current_track"] = 0
+    job["total_tracks"] = len(job.get("tracks", []))
     write_json(job_path, job)
 
     try:
@@ -201,6 +229,11 @@ def process_job(job_path: Path) -> None:
         languages: list[str] = []
 
         for index, track in enumerate(job.get("tracks", []), start=1):
+            job["current_track"] = index
+            job["stage"] = "transcribing"
+            job["updated_at"] = utc_now()
+            write_json(job_path, job)
+
             logger.info(
                 "Job %s transcribing track %s/%s participant=%s",
                 job["job_id"],
@@ -233,6 +266,7 @@ def process_job(job_path: Path) -> None:
 
         job.update({
             "stage": "summarizing" if SUMMARY_ENABLED else "completed",
+            "updated_at": utc_now(),
             "transcript_path": str(transcript_path),
             "text_transcript_path": str(Path(job["output_dir"]) / "transcript.txt"),
             "segment_count": len(all_segments),
@@ -256,6 +290,7 @@ def process_job(job_path: Path) -> None:
         job.update({
             "status": "completed",
             "stage": "completed",
+            "updated_at": utc_now(),
             "completed_at": utc_now(),
             "summary_path": str(summary_path) if summary_path else None,
             "error": None,
@@ -278,6 +313,7 @@ def process_job(job_path: Path) -> None:
             "status": "failed",
             "stage": "failed",
             "completed_at": utc_now(),
+            "updated_at": utc_now(),
             "error": str(error),
         })
         write_json(job_path, job)
@@ -295,7 +331,18 @@ def get_queued_jobs() -> list[Path]:
 
 
 def worker_loop() -> None:
-    logger.info("Worker loop started")
+    logger.info("Worker process loop started pid=%s", os.getpid())
+    # Any processing job belongs to a previous worker process and is safe to resume.
+    _recover_abandoned_jobs()
+
+    if MODEL_WARMUP:
+        try:
+            get_whisper_model()
+            if SUMMARY_ENABLED:
+                _load_model()
+            logger.info("AI models warmed successfully in worker process")
+        except Exception:
+            logger.exception("AI model warmup failed; lazy loading remains enabled")
 
     while True:
         try:
@@ -310,11 +357,51 @@ def worker_loop() -> None:
             time.sleep(WORKER_POLL_SECONDS)
 
 
-def start_worker() -> threading.Thread:
-    thread = threading.Thread(
+def _spawn_worker() -> multiprocessing.Process:
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
         target=worker_loop,
         name="defcomm-transcription-worker",
         daemon=True,
     )
-    thread.start()
-    return thread
+    process.start()
+    return process
+
+
+def _supervise_worker() -> None:
+    global _worker_process
+    while True:
+        process = _worker_process
+        if process is not None:
+            process.join()
+            logger.error(
+                "AI worker process exited exitcode=%s; restarting",
+                process.exitcode,
+            )
+        time.sleep(3)
+        try:
+            _worker_process = _spawn_worker()
+        except Exception:
+            logger.exception("Failed to restart AI worker process")
+            time.sleep(5)
+
+
+def start_worker() -> multiprocessing.Process:
+    global _worker_process, _worker_supervisor
+    if _worker_process is not None and _worker_process.is_alive():
+        return _worker_process
+
+    _worker_process = _spawn_worker()
+    if _worker_supervisor is None or not _worker_supervisor.is_alive():
+        _worker_supervisor = threading.Thread(
+            target=_supervise_worker,
+            name="defcomm-ai-worker-supervisor",
+            daemon=True,
+        )
+        _worker_supervisor.start()
+    return _worker_process
+
+
+def worker_is_alive() -> bool:
+    return bool(_worker_process is not None and _worker_process.is_alive())
+
